@@ -56,6 +56,12 @@ export interface Agent {
   extractUsageStats?(parsedResponse: unknown): AgentUsageStats | undefined;
 
   /**
+   * Returns an optional preamble to prepend to every ACP prompt.
+   * Useful for agent-specific context like working directory hints.
+   */
+  getPromptPreamble?(): string;
+
+  /**
    * Returns directories where this agent writes its own logs.
    * Paths are resolved using $HOME so they work regardless of UID mapping.
    */

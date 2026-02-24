@@ -15,7 +15,7 @@ import {
 } from '@agentclientprotocol/sdk';
 import colors from 'ansi-colors';
 import { existsSync, readFileSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import type {
   WorkflowAgentStep,
   WorkflowOutput,
@@ -30,7 +30,9 @@ import {
   type StepResult,
 } from 'rover-core';
 import { ACPClient } from './acp-client.js';
+import { GeminiOrQwenACPClient } from './gemini-or-qwen-acp-client.js';
 import { createAgent } from './agents/index.js';
+import type { Agent } from './agents/types.js';
 import { copyFileSync, rmSync } from 'node:fs';
 
 export interface ACPRunnerStepResult extends StepResult {}
@@ -45,6 +47,20 @@ export interface ACPRunnerConfig {
   logger?: JsonlLogger;
 }
 
+/**
+ * Format an error into a human-readable string.
+ * Handles Error instances, plain objects (e.g. JSON-RPC errors), and primitives.
+ */
+function formatError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (error !== null && typeof error === 'object') {
+    return JSON.stringify(error, null, 2);
+  }
+  return String(error);
+}
+
 export class ACPRunner {
   private workflow: WorkflowManager;
   private inputs: Map<string, string>;
@@ -56,6 +72,7 @@ export class ACPRunner {
   private logger?: JsonlLogger;
 
   // ACP connection state
+  private agent: Agent | null = null;
   private agentProcess: ChildProcess | null = null;
   private connection: ClientSideConnection | null = null;
   private client: ACPClient | null = null;
@@ -79,6 +96,19 @@ export class ACPRunner {
   }
 
   /**
+   * Create the appropriate ACPClient subclass for the current tool.
+   */
+  private createACPClient(): ACPClient {
+    switch (this.tool.toLowerCase()) {
+      case 'gemini':
+      case 'qwen':
+        return new GeminiOrQwenACPClient();
+      default:
+        return new ACPClient();
+    }
+  }
+
+  /**
    * Initialize the ACP connection (protocol handshake)
    * Maps to the ACP initialize method
    */
@@ -87,25 +117,26 @@ export class ACPRunner {
       return;
     }
 
-    const agent = createAgent(this.tool, 'latest', this.defaultModel);
-    const command = agent.acpCommand;
-    const args = agent.toolArguments();
+    this.agent = createAgent(this.tool, 'latest', this.defaultModel);
+    const agent = this.agent;
+    const agentArgs = agent.toolArguments();
     console.log(
-      colors.blue(`\n🚀 Starting ACP agent: ${command} ${args.join(' ')}`)
+      colors.blue(
+        `\n🚀 Starting ACP agent: ${agent.acpCommand} ${agentArgs.join(' ')}`
+      )
     );
 
     // Spawn the agent as a subprocess
-    this.agentProcess = spawn(command, args, {
+    this.agentProcess = spawn(agent.acpCommand, agentArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: process.env,
     });
 
-    // Forward stderr only in verbose mode
+    // Always forward stderr for debugging (can be seen in docker logs)
     if (this.agentProcess.stderr) {
       this.agentProcess.stderr.on('data', (chunk: Buffer) => {
-        if (VERBOSE) {
-          process.stderr.write(chunk);
-        }
+        const text = chunk.toString();
+        console.log(colors.yellow(`[ACP Agent stderr] ${text.trim()}`));
       });
     }
 
@@ -119,14 +150,14 @@ export class ACPRunner {
       this.agentProcess.stdout
     ) as ReadableStream<Uint8Array>;
 
-    // Create the client connection
-    this.client = new ACPClient();
+    // Create the client connection (agent-specific subclass when needed)
+    this.client = this.createACPClient();
     const stream = ndJsonStream(input, output);
     this.connection = new ClientSideConnection(_agent => this.client!, stream);
 
     try {
       // Initialize the connection (protocol handshake)
-      const initResult = await this.connection.initialize({
+      const initRequest = {
         protocolVersion: PROTOCOL_VERSION,
         clientCapabilities: {
           fs: {
@@ -135,7 +166,19 @@ export class ACPRunner {
           },
           terminal: true,
         },
-      });
+      };
+
+      console.log(
+        colors.gray('[ACP] Sending initialize request:'),
+        colors.cyan(JSON.stringify(initRequest, null, 2))
+      );
+
+      const initResult = await this.connection.initialize(initRequest);
+
+      console.log(
+        colors.gray('[ACP] Initialize response:'),
+        colors.cyan(JSON.stringify(initResult, null, 2))
+      );
 
       this.isConnectionInitialized = true;
 
@@ -145,9 +188,13 @@ export class ACPRunner {
         )
       );
     } catch (error) {
+      console.log(
+        colors.red('[ACP] Initialize failed:'),
+        colors.red(formatError(error))
+      );
       this.close();
       throw new Error(
-        `Failed to initialize ACP connection: ${error instanceof Error ? error.message : String(error)}`
+        `Failed to initialize ACP connection: ${formatError(error)}`
       );
     }
   }
@@ -174,10 +221,22 @@ export class ACPRunner {
 
     try {
       // Create a new session
-      const sessionResult = await this.connection.newSession({
+      const sessionRequest = {
         cwd: cwd || process.cwd(),
         mcpServers,
-      });
+      };
+
+      console.log(
+        colors.gray('[ACP] Sending newSession request:'),
+        colors.cyan(JSON.stringify(sessionRequest, null, 2))
+      );
+
+      const sessionResult = await this.connection.newSession(sessionRequest);
+
+      console.log(
+        colors.gray('[ACP] newSession response:'),
+        colors.cyan(JSON.stringify(sessionResult, null, 2))
+      );
 
       this.sessionId = sessionResult.sessionId;
       this.isSessionCreated = true;
@@ -186,9 +245,11 @@ export class ACPRunner {
 
       return sessionResult.sessionId;
     } catch (error) {
-      throw new Error(
-        `Failed to create session: ${error instanceof Error ? error.message : String(error)}`
+      console.log(
+        colors.red('[ACP] newSession failed:'),
+        colors.red(formatError(error))
       );
+      throw new Error(`Failed to create session: ${formatError(error)}`);
     }
   }
 
@@ -279,21 +340,36 @@ export class ACPRunner {
         }
       }
 
+      console.log(
+        colors.gray(
+          '[ACP] Sending prompt request (prompt length: ' +
+            prompt.length +
+            ' chars)'
+        )
+      );
+
       const promptResult = await this.connection.prompt({
         sessionId: this.sessionId,
         prompt: promptContent,
       });
+
+      console.log(
+        colors.gray('[ACP] Prompt response:'),
+        colors.cyan(JSON.stringify(promptResult, null, 2))
+      );
 
       // Stop capturing and get the accumulated response
       const response = this.client.stopCapturing();
 
       return { stopReason: promptResult.stopReason, response };
     } catch (error) {
+      console.log(
+        colors.red('[ACP] Prompt failed:'),
+        colors.red(formatError(error))
+      );
       // Stop capturing on error too
       this.client.stopCapturing();
-      throw new Error(
-        `Failed to send prompt: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw new Error(`Failed to send prompt: ${formatError(error)}`);
     }
   }
 
@@ -322,9 +398,7 @@ export class ACPRunner {
 
       console.log(colors.gray(`🔄 Model changed to: ${modelId}`));
     } catch (error) {
-      throw new Error(
-        `Failed to set model: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw new Error(`Failed to set model: ${formatError(error)}`);
     }
   }
 
@@ -354,9 +428,7 @@ export class ACPRunner {
         colors.yellow(`⚠️  Prompt cancelled for session: ${this.sessionId}`)
       );
     } catch (error) {
-      throw new Error(
-        `Failed to cancel prompt: ${error instanceof Error ? error.message : String(error)}`
-      );
+      throw new Error(`Failed to cancel prompt: ${formatError(error)}`);
     }
   }
 
@@ -398,6 +470,20 @@ export class ACPRunner {
         agent: this.tool,
         progress: currentProgress,
       });
+
+      // Set the model for this step if specified (step-level > CLI flag > workflow defaults)
+      const stepModel = this.workflow.getStepModel(stepId, this.defaultModel);
+      if (stepModel) {
+        try {
+          await this.setModel(stepModel);
+        } catch (error) {
+          console.log(
+            colors.yellow(
+              `⚠️  Could not set model to ${stepModel} via ACP: ${formatError(error)}`
+            )
+          );
+        }
+      }
 
       // Build the prompt for this step (simplified for ACP - no file content injection)
       const prompt = this.buildACPPrompt(step);
@@ -459,8 +545,7 @@ export class ACPRunner {
         outputs,
       };
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
+      const errorMessage = formatError(error);
 
       console.log(colors.red(`✗ Step '${step.name}' failed: ${errorMessage}`));
 
@@ -569,6 +654,12 @@ export class ACPRunner {
     const outputInstructions = this.generateOutputInstructions(step);
     prompt += outputInstructions;
 
+    // Prepend agent-specific preamble (e.g. project root hint for Gemini)
+    const preamble = this.agent?.getPromptPreamble?.();
+    if (preamble) {
+      prompt = `${preamble}\n\n${prompt}`;
+    }
+
     // Display warnings if any
     if (warnings.length > 0) {
       showList(
@@ -624,8 +715,17 @@ export class ACPRunner {
 
       fileOutputs.forEach(output => {
         instructions += `- **${output.name}**: ${output.description}\n`;
-        instructions += `  - Create this file in the current working directory\n`;
-        instructions += `  - Filename: \`${output.filename}\`\n\n`;
+
+        if (this.tool == 'gemini' || this.tool == 'qwen') {
+          // Gemini refuses to write files using relative paths, so we must
+          // provide an absolute path in the prompt.
+          const absolutePath = resolve(output.filename!);
+          instructions += `  - When creating the file, call the write_file tool using the following absolute path. THIS IS MANDATORY\n`;
+          instructions += `  - Filename: \`${absolutePath}\`\n\n`;
+        } else {
+          instructions += `  - Create this file in the current working directory\n`;
+          instructions += `  - Filename: \`${output.filename}\`\n\n`;
+        }
       });
 
       instructions +=
@@ -674,7 +774,7 @@ export class ACPRunner {
     } catch (error) {
       return {
         success: false,
-        error: `Failed to parse outputs: ${error instanceof Error ? error.message : String(error)}`,
+        error: `Failed to parse outputs: ${formatError(error)}`,
       };
     }
   }
@@ -881,7 +981,7 @@ export class ACPRunner {
       } catch (error) {
         console.log(
           colors.yellow(
-            `⚠️  Could not read file '${output.filename}': ${error instanceof Error ? error.message : String(error)}`
+            `⚠️  Could not read file '${output.filename}': ${formatError(error)}`
           )
         );
         outputs.set(output.name, '[Could not read file]');
