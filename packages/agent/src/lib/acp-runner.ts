@@ -286,7 +286,12 @@ export class ACPRunner {
         blob?: string;
       }>;
     }
-  ): Promise<{ stopReason: string; response: string }> {
+  ): Promise<{
+    stopReason: string;
+    response: string;
+    tokens?: number;
+    cost?: number;
+  }> {
     if (!this.isConnectionInitialized || !this.connection) {
       throw new Error(
         'Connection not initialized. Call initializeConnection() first.'
@@ -375,7 +380,19 @@ export class ACPRunner {
       // Stop capturing and get the accumulated response
       const response = this.client.stopCapturing();
 
-      return { stopReason: promptResult.stopReason, response };
+      // Extract usage stats from the ACP response
+      const tokens = promptResult.usage
+        ? (promptResult.usage.inputTokens ?? 0) +
+          (promptResult.usage.outputTokens ?? 0) +
+          (promptResult.usage.cachedReadTokens ?? 0) +
+          (promptResult.usage.cachedWriteTokens ?? 0)
+        : undefined;
+
+      // Get per-prompt cost delta from the client's tracked usage_update events
+      const promptCost = this.client.getLastPromptCost();
+      const cost = promptCost.amount > 0 ? promptCost.amount : undefined;
+
+      return { stopReason: promptResult.stopReason, response, tokens, cost };
     } catch (error) {
       console.log(
         colors.red('[ACP] Prompt failed:'),
@@ -517,6 +534,12 @@ export class ACPRunner {
       // Send the prompt via ACP session
       const promptResult = await this.sendPrompt(prompt);
 
+      // Track usage stats from ACP response
+      const tokens = promptResult.tokens;
+      const cost = promptResult.cost;
+      // Use the model set for this step, or the default model
+      const model = stepModel || this.defaultModel;
+
       if (VERBOSE) {
         console.log(
           colors.gray(`\n✅ Agent completed with: ${promptResult.stopReason}`)
@@ -552,12 +575,18 @@ export class ACPRunner {
         stepName: step.name,
         agent: this.tool,
         duration,
+        tokens,
+        cost,
+        model,
       });
 
       return {
         id: step.id,
         success: true,
         duration,
+        tokens,
+        cost,
+        model,
         outputs,
       };
     } catch (error) {
